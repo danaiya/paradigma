@@ -1,0 +1,184 @@
+import asyncio
+import time
+from typing import Any
+
+SENTINEL = object()
+
+RECORDS: list[dict[str, Any]] = [
+    {"student": "Алия", "grade": 85},
+    {"student": "Дамир", "grade": 54},
+    {"student": "Руслан", "grade": 78},
+    {"student": "", "grade": 91},       # Ошибка: пустое имя
+    {"student": "Мадина", "grade": 105},  # Ошибка: оценка > 100
+]
+
+
+def validate(record: dict[str, Any]) -> None:
+    """Проверяет корректность имени студента и диапазона оценки."""
+    student = str(record.get("student", "")).strip()
+    grade = record.get("grade")
+
+    if not student:
+        raise ValueError("Не указано имя студента")
+    if not isinstance(grade, (int, float)) or isinstance(grade, bool) or not (0 <= grade <= 100):
+        raise ValueError("Оценка должна быть числом от 0 до 100")
+
+
+async def process(record: dict[str, Any], delay: float = 0.25) -> dict[str, Any]:
+    """Имитирует асинхронную обработку и сохранение записи."""
+    await asyncio.sleep(delay)
+    validate(record)
+    grade = record["grade"]
+    return {
+        "student": str(record["student"]).strip(),
+        "grade": grade,
+        "status": "зачет" if grade >= 60 else "незачет",
+    }
+
+
+async def producer(
+    queue: asyncio.Queue[Any],
+    data: list[dict[str, Any]],
+    num_consumers: int,
+    delay: float = 0.15,
+) -> None:
+    """Помещает исходные записи в очередь и отправляет сигналы завершения."""
+    for record in data:
+        await asyncio.sleep(delay)
+        await queue.put(record)
+
+    for _ in range(num_consumers):
+        await queue.put(SENTINEL)
+
+
+async def consumer(
+    name: str,
+    queue: asyncio.Queue[Any],
+    results: list[dict[str, Any]],
+    errors: list[str],
+    timeout_sec: float = 1.0,
+    process_delay: float = 0.25,
+) -> None:
+    """Извлекает записи из очереди, проверяет их с учетом тайм-аута и сохраняет результат."""
+    while True:
+        item = await queue.get()
+        try:
+            if item is SENTINEL:
+                return
+
+            try:
+                async with asyncio.timeout(timeout_sec):
+                    result = await process(item, delay=process_delay)
+                results.append(result)
+            except TimeoutError:
+                errors.append(f"{item}: превышено время ожидания ({timeout_sec} с)")
+            except ValueError as error:
+                errors.append(f"{item}: {error}")
+            except Exception as error:
+                errors.append(f"{item}: непредвиденная ошибка ({error})")
+        finally:
+            queue.task_done()
+
+
+async def run_pipeline(
+    data: list[dict[str, Any]],
+    num_consumers: int = 2,
+    maxsize: int = 3,
+    timeout_sec: float = 1.0,
+    process_delay: float = 0.25,
+) -> dict[str, Any]:
+    """Запускает асинхронный конвейер и возвращает итоговую статистику."""
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    started = time.perf_counter()
+
+    workers = [
+        asyncio.create_task(
+            consumer(
+                name=f"worker-{i}",
+                queue=queue,
+                results=results,
+                errors=errors,
+                timeout_sec=timeout_sec,
+                process_delay=process_delay,
+            )
+        )
+        for i in range(1, num_consumers + 1)
+    ]
+
+    await producer(queue, data, num_consumers=num_consumers)
+    await queue.join()
+    await asyncio.gather(*workers)
+
+    elapsed = time.perf_counter() - started
+    average = sum(item["grade"] for item in results) / len(results) if results else 0.0
+    rating = sorted(results, key=lambda x: x["grade"], reverse=True)
+
+    return {
+        "processed": len(results),
+        "errors_count": len(errors),
+        "average": average,
+        "elapsed": elapsed,
+        "results": results,
+        "rating": rating,
+        "errors": errors,
+    }
+
+
+async def run_tests() -> None:
+    """Выполняет 7 тестовых сценариев из плана тестирования."""
+    # Сценарий 1: Все записи корректны
+    valid_data = [{"student": "Алия", "grade": 90}, {"student": "Руслан", "grade": 70}]
+    res1 = await run_pipeline(valid_data)
+    assert res1["processed"] == 2 and res1["errors_count"] == 0, "Тест 1 провален"
+
+    # Сценарий 2: Пустое имя
+    res2 = await run_pipeline([{"student": "   ", "grade": 80}, {"student": "Алия", "grade": 80}])
+    assert res2["processed"] == 1 and res2["errors_count"] == 1, "Тест 2 провален"
+
+    # Сценарий 3: Оценка < 0 или > 100
+    res3 = await run_pipeline([{"student": "А", "grade": -5}, {"student": "Б", "grade": 101}])
+    assert res3["processed"] == 0 and res3["errors_count"] == 2, "Тест 3 провален"
+
+    # Сценарий 4: Очередь maxsize == 1
+    res4 = await run_pipeline(valid_data, maxsize=1)
+    assert res4["processed"] == 2 and res4["errors_count"] == 0, "Тест 4 провален"
+
+    # Сценарий 5: Один потребитель против двух
+    four_items = valid_data * 2
+    res_1_worker = await run_pipeline(four_items, num_consumers=1, process_delay=0.2)
+    res_2_workers = await run_pipeline(four_items, num_consumers=2, process_delay=0.2)
+    assert res_2_workers["elapsed"] < res_1_worker["elapsed"], "Тест 5 провален"
+
+    # Сценарий 6: Исключение / тайм-аут в process (task_done вызывается, join не зависает)
+    res6 = await run_pipeline(valid_data, timeout_sec=0.05, process_delay=0.2)
+    assert res6["errors_count"] == 2 and res6["processed"] == 0, "Тест 6 провален"
+
+    # Сценарий 7: Пустой входной список (нет деления на ноль)
+    res7 = await run_pipeline([])
+    assert res7["processed"] == 0 and res7["average"] == 0.0, "Тест 7 провален"
+
+    print("Все 7 тестовых сценариев успешно пройдены!\n")
+
+
+async def main() -> None:
+    await run_tests()
+
+    stats = await run_pipeline(RECORDS, num_consumers=2, maxsize=3)
+    print(f"Обработано: {stats['processed']}")
+    print(f"Ошибок: {stats['errors_count']}")
+    print(f"Средний балл: {stats['average']:.2f}")
+    print(f"Время выполнения: {stats['elapsed']:.2f} с")
+
+    print("\nРейтинг студентов:")
+    for pos, item in enumerate(stats["rating"], start=1):
+        print(f"  {pos}. {item['student']} — {item['grade']} ({item['status']})")
+
+    print("\nЗафиксированные ошибки:")
+    for err in stats["errors"]:
+        print(" -", err)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
